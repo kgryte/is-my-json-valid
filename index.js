@@ -4,7 +4,7 @@ var jsonpointer = require('jsonpointer')
 var xtend = require('xtend')
 var formats = require('./formats')
 
-var get = function(obj, ptr) {
+var get = function(obj, additionalSchemas, ptr) {
   if (/^https?:\/\//.test(ptr)) return null
 
   var visit = function(sub) {
@@ -24,12 +24,33 @@ var get = function(obj, ptr) {
   try {
     return jsonpointer.get(obj, decodeURI(ptr))
   } catch (err) {
-    return null
+    var end = ptr.indexOf('#')
+    var other
+    // external reference
+    if (end !== 0) {
+      // fragment doesn't exist.
+      if (end === -1) {
+        other = additionalSchemas[ptr]
+      } else {
+        var ext = ptr.slice(0, end)
+        other = additionalSchemas[ext]
+        var fragment = ptr.slice(end).replace(/^#/, '')
+        try {
+          return jsonpointer.get(other, fragment)
+        } catch (err) {}
+      }
+    } else {
+      other = additionalSchemas[ptr]
+    }
+    return other || null
   }
 }
 
 var formatName = function(field) {
-  return field.replace(/\[[^\]]+\]/g, '.*')
+  field = JSON.stringify(field)
+  var pattern = /\[([^\[\]"]+)\]/
+  while (pattern.test(field)) field = field.replace(pattern, '."+$1+"')
+  return field
 }
 
 var types = {}
@@ -59,7 +80,7 @@ types.number = function(name) {
 }
 
 types.integer = function(name) {
-  return 'typeof '+name+' === "number" && (('+name+' | 0) === '+name+' || '+name+' > 9007199254740992 || '+name+' < -9007199254740992)'
+  return 'typeof '+name+' === "number" && (Math.floor('+name+') === '+name+' || '+name+' > 9007199254740992 || '+name+' < -9007199254740992)'
 }
 
 types.string = function(name) {
@@ -84,6 +105,9 @@ var toType = function(node) {
 var compile = function(schema, cache, root, reporter, opts) {
   var fmts = opts ? xtend(formats, opts.formats) : formats
   var scope = {unique:unique, formats:fmts}
+  var verbose = opts ? !!opts.verbose : false;
+  var greedy = opts && opts.greedy !== undefined ?
+    opts.greedy : false;
 
   var syms = {}
   var gensym = function(name) {
@@ -106,7 +130,7 @@ var compile = function(schema, cache, root, reporter, opts) {
     return v
   }
 
-  var visit = function(name, node, reporter) {
+  var visit = function(name, node, reporter, filter) {
     var properties = node.properties
     var type = node.type
     var tuple = false
@@ -121,34 +145,22 @@ var compile = function(schema, cache, root, reporter, opts) {
     }
 
     var indent = 0
-    var error = function(msg) {
-      if (reporter === false) {
-        validate('errors++')
-        return
+    var error = function(msg, prop, value) {
+      validate('errors++')
+      if (reporter === true) {
+        validate('if (validate.errors === null) validate.errors = []')
+        if (verbose) {
+          validate('validate.errors.push({field:%s,message:%s,value:%s})', formatName(prop || name), JSON.stringify(msg), value || name)
+        } else {
+          validate('validate.errors.push({field:%s,message:%s})', formatName(prop || name), JSON.stringify(msg))
+        }
       }
-
-      var n = gensym('error')
-      scope[n] = {field:formatName(name), message:msg}
-      validate
-        ('errors++')
-        ('if (validate.errors === null) validate.errors = []')
-        ('validate.errors.push(%s)', n)
     }
 
     if (node.required === true) {
       indent++
       validate('if (%s === undefined) {', name)
       error('is required')
-      validate('} else {')
-    } else if (node.required) {
-      indent++
-
-      var isUndefined = function(req) {
-        return genobj(name, req) + ' === undefined'
-      }
-
-      validate('if (%s) {', node.required.map(isUndefined).join(' || ') || 'false')
-      error('missing required properties')
       validate('} else {')
     } else {
       indent++
@@ -176,12 +188,13 @@ var compile = function(schema, cache, root, reporter, opts) {
       } else if (node.additionalItems) {
         var i = genloop()
         validate('for (var %s = %d; %s < %s.length; %s++) {', i, node.items.length, i, name, i)
-        visit(name+'['+i+']', node.additionalItems, reporter)
+        visit(name+'['+i+']', node.additionalItems, reporter, filter)
         validate('}')
       }   
     }
 
     if (node.format && fmts[node.format]) {
+      if (type !== 'string' && formats[node.format]) validate('if (%s) {', types.string(name))
       var n = gensym('format')
       scope[n] = fmts[node.format]
 
@@ -189,6 +202,29 @@ var compile = function(schema, cache, root, reporter, opts) {
       else validate('if (!%s.test(%s)) {', n, name)
       error('must be '+node.format+' format')
       validate('}')
+      if (type !== 'string' && formats[node.format]) validate('}')
+    }
+
+    if (Array.isArray(node.required)) {
+      var isUndefined = function(req) {
+        return genobj(name, req) + ' === undefined'
+      }
+
+      var checkRequired = function (req) {
+        var prop = genobj(name, req);
+        validate('if (%s === undefined) {', prop)
+        error('is required', prop)
+        validate('missing++')
+        validate('}')
+      }
+      validate('if ((%s)) {', type !== 'object' ? types.object(name) : 'true')
+      validate('var missing = 0')
+      node.required.map(checkRequired)
+      validate('}');
+      if (!greedy) {
+        validate('if (missing === 0) {')
+        indent++
+      }
     }
 
     if (node.uniqueItems) {
@@ -235,7 +271,7 @@ var compile = function(schema, cache, root, reporter, opts) {
         }
         if (typeof deps === 'object') {
           validate('if (%s !== undefined) {', genobj(name, key))
-          visit(name, deps, reporter)
+          visit(name, deps, reporter, filter)
           validate('}')
         }
       })
@@ -266,9 +302,10 @@ var compile = function(schema, cache, root, reporter, opts) {
           ('if (%s) {', additionalProp)
 
       if (node.additionalProperties === false) {
-        error('has additional properties')
+        if (filter) validate('delete %s', name+'['+keys+'['+i+']]')
+        error('has additional properties', null, JSON.stringify(name+'.') + ' + ' + keys + '['+i+']')
       } else {
-        visit(name+'['+keys+'['+i+']]', node.additionalProperties, reporter)
+        visit(name+'['+keys+'['+i+']]', node.additionalProperties, reporter, filter)
       }
 
       validate
@@ -279,7 +316,7 @@ var compile = function(schema, cache, root, reporter, opts) {
     }
 
     if (node.$ref) {
-      var sub = get(root, node.$ref)
+      var sub = get(root, opts && opts.schemas || {}, node.$ref)
       if (sub) {
         var fn = cache[node.$ref]
         if (!fn) {
@@ -299,7 +336,7 @@ var compile = function(schema, cache, root, reporter, opts) {
     if (node.not) {
       var prev = gensym('prev')
       validate('var %s = errors', prev)
-      visit(name, node.not, false)
+      visit(name, node.not, false, filter)
       validate('if (%s === errors) {', prev)
       error('negative schema matches')
       validate('} else {')
@@ -312,7 +349,7 @@ var compile = function(schema, cache, root, reporter, opts) {
 
       var i = genloop()
       validate('for (var %s = 0; %s < %s.length; %s++) {', i, i, name, i)
-      visit(name+'['+i+']', node.items, reporter)
+      visit(name+'['+i+']', node.items, reporter, filter)
       validate('}')
 
       if (type !== 'array') validate('}')
@@ -329,7 +366,7 @@ var compile = function(schema, cache, root, reporter, opts) {
       Object.keys(node.patternProperties).forEach(function(key) {
         var p = patterns(key)
         validate('if (%s.test(%s)) {', p, keys+'['+i+']')
-        visit(name+'['+keys+'['+i+']]', node.patternProperties[key], reporter)
+        visit(name+'['+keys+'['+i+']]', node.patternProperties[key], reporter, filter)
         validate('}')
       })
 
@@ -348,7 +385,7 @@ var compile = function(schema, cache, root, reporter, opts) {
 
     if (node.allOf) {
       node.allOf.forEach(function(sch) {
-        visit(name, sch, reporter)
+        visit(name, sch, reporter, filter)
       })
     }
 
@@ -362,7 +399,7 @@ var compile = function(schema, cache, root, reporter, opts) {
           validate('if (errors !== %s) {', prev)
             ('errors = %s', prev)
         }
-        visit(name, sch, false)
+        visit(name, sch, false, false)
       })
       node.anyOf.forEach(function(sch, i) {
         if (i) validate('}')
@@ -381,7 +418,7 @@ var compile = function(schema, cache, root, reporter, opts) {
         ('var %s = 0', passes)
 
       node.oneOf.forEach(function(sch, i) {
-        visit(name, sch, false)
+        visit(name, sch, false, false)
         validate('if (%s === errors) {', prev)
           ('%s++', passes)
         ('} else {')
@@ -481,7 +518,11 @@ var compile = function(schema, cache, root, reporter, opts) {
 
     if (properties) {
       Object.keys(properties).forEach(function(p) {
-        visit(genobj(name, p), properties[p], reporter)
+        if (Array.isArray(type) && type.indexOf('null') !== -1) validate('if (%s !== null) {', name)
+
+        visit(genobj(name, p), properties[p], reporter, filter)
+
+        if (Array.isArray(type) && type.indexOf('null') !== -1) validate('}')
       })
     }
 
@@ -493,7 +534,7 @@ var compile = function(schema, cache, root, reporter, opts) {
       ('validate.errors = null')
       ('var errors = 0')
 
-  visit('data', schema, reporter)
+  visit('data', schema, reporter, opts && opts.filter)
 
   validate
       ('return errors === 0')
@@ -521,4 +562,12 @@ var compile = function(schema, cache, root, reporter, opts) {
 module.exports = function(schema, opts) {
   if (typeof schema === 'string') schema = JSON.parse(schema)
   return compile(schema, {}, schema, true, opts)
+}
+
+module.exports.filter = function(schema, opts) {
+  var validate = module.exports(schema, xtend(opts, {filter: true}))
+  return function(sch) {
+    validate(sch)
+    return sch
+  }
 }
