@@ -2,9 +2,13 @@ var tape = require('tape')
 var schema = require('./fixtures/schema.json')
 var validator = require('../')
 
-tape('nested', function(t) {
-	var validate = validator(schema)
+tape('external reference', function(t) {
+	var validate = validator({
+		'$ref': '#ext'
+	}, {
+		schemas: {'ext':schema}
+	})
 
-	t.ok(validate({x:{}}), 'should be valid')
+	t.notOk(validate({port:80}), 'should be invalid')
 	t.end()
 })
